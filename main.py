@@ -1,11 +1,15 @@
 
-from typing import Literal
+import asyncio
 import json
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from ollama import AsyncClient
 from pydantic import BaseModel, Field
+
+from Knowledge.rag import generate_rag_answer
+from agents import run_multi_agent_investigation
 
 
 # =========================================================
@@ -14,8 +18,11 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="EnterpriseOps AI",
-    description="AI-powered business order investigation and workflow automation",
-    version="1.1.0",
+    description=(
+        "AI-powered business order investigation, "
+        "RAG, multi-agent analysis, and workflow automation"
+    ),
+    version="2.0.0",
 )
 
 JAVA_API = "http://localhost:8080/api/v1/orders"
@@ -26,7 +33,7 @@ OLLAMA_MODEL = "qwen2.5:3b"
 
 
 # =========================================================
-# 2. PYDANTIC RESPONSE AND REQUEST MODELS
+# 2. REQUEST AND RESPONSE MODELS
 # =========================================================
 
 class OrderFacts(BaseModel):
@@ -45,15 +52,28 @@ class AIOrderInvestigation(BaseModel):
 
 class CreateTicketRequest(BaseModel):
     orderNumber: str = Field(min_length=1)
-    issueDescription: str = Field(min_length=5, max_length=2000)
+    issueDescription: str = Field(
+        min_length=5,
+        max_length=2000,
+    )
     priority: Literal["LOW", "MEDIUM", "HIGH"]
 
 
 class TicketProposal(BaseModel):
     order_number: str
-    issue_description: str = Field(min_length=5, max_length=2000)
+    issue_description: str = Field(
+        min_length=5,
+        max_length=2000,
+    )
     priority: Literal["LOW", "MEDIUM", "HIGH"]
     reason: str
+
+
+class RAGQuestionRequest(BaseModel):
+    question: str = Field(
+        min_length=3,
+        max_length=2000,
+    )
 
 
 # =========================================================
@@ -65,6 +85,7 @@ def health():
     return {
         "status": "healthy",
         "service": "enterpriseops-ai",
+        "version": "2.0.0",
     }
 
 
@@ -74,7 +95,9 @@ def health():
 
 async def fetch_order(order_number: str) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0
+        ) as client:
             response = await client.get(
                 f"{JAVA_API}/{order_number}"
             )
@@ -88,7 +111,9 @@ async def fetch_order(order_number: str) -> dict:
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to the Java order service",
+            detail=(
+                "Could not connect to the Java order service"
+            ),
         ) from exc
 
     if response.status_code == 404:
@@ -103,7 +128,21 @@ async def fetch_order(order_number: str) -> dict:
             detail="Java order service returned an error",
         )
 
-    return response.json()
+    try:
+        order = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Java order service returned invalid JSON",
+        ) from exc
+
+    if not isinstance(order, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Java order service returned an invalid order",
+        )
+
+    return order
 
 
 # =========================================================
@@ -186,7 +225,7 @@ Rules:
 Requested order number: {order_number}
 
 Order data:
-{json.dumps(order, indent=2)}
+{json.dumps(order, indent=2, ensure_ascii=False, default=str)}
 """
 
     investigation = await generate_structured_response(
@@ -229,7 +268,7 @@ Rules:
 Requested order number: {order_number}
 
 Order data:
-{json.dumps(order, indent=2)}
+{json.dumps(order, indent=2, ensure_ascii=False, default=str)}
 """
 
     proposal = await generate_structured_response(
@@ -264,7 +303,9 @@ async def propose_ticket(order_number: str):
 # =========================================================
 
 @app.post("/tickets", status_code=201)
-async def create_support_ticket(request: CreateTicketRequest):
+async def create_support_ticket(
+    request: CreateTicketRequest,
+):
     order = await fetch_order(request.orderNumber)
 
     payload = {
@@ -274,7 +315,9 @@ async def create_support_ticket(request: CreateTicketRequest):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0
+        ) as client:
             response = await client.post(
                 JAVA_TICKETS_API,
                 json=payload,
@@ -284,8 +327,8 @@ async def create_support_ticket(request: CreateTicketRequest):
         raise HTTPException(
             status_code=504,
             detail=(
-                "Ticket creation timed out. Check the Java service "
-                "before retrying to avoid creating a duplicate."
+                "Ticket creation timed out. Check the Java "
+                "service before retrying to avoid duplicates."
             ),
         ) from exc
 
@@ -299,7 +342,10 @@ async def create_support_ticket(request: CreateTicketRequest):
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Java service could not create the ticket",
+                "message": (
+                    "Java service could not create the ticket"
+                ),
+                "java_status_code": response.status_code,
                 "response": response.text,
             },
         )
@@ -320,22 +366,24 @@ async def create_workflow_from_ai(order_number: str):
     # Step 1: Retrieve authoritative order data.
     order = await fetch_order(order_number)
 
-    # Step 2: Generate and validate the AI proposal.
+    # Step 2: Generate the AI ticket proposal.
     proposal = await generate_ticket_proposal(
         order_number,
         order,
     )
 
-    # Step 3: Match CreateWorkflowRequest.java.
+    # Step 3: Prepare the Spring Boot request.
     payload = {
         "orderNumber": proposal.order_number,
         "issueDescription": proposal.issue_description,
         "priority": proposal.priority,
     }
 
-    # Step 4: Ask Spring Boot to persist the workflow.
+    # Step 4: Ask Spring Boot to create the workflow.
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0
+        ) as client:
             response = await client.post(
                 JAVA_WORKFLOWS_API,
                 json=payload,
@@ -353,7 +401,9 @@ async def create_workflow_from_ai(order_number: str):
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to the Java workflow service",
+            detail=(
+                "Could not connect to the Java workflow service"
+            ),
         ) from exc
 
     if response.is_error:
@@ -366,10 +416,83 @@ async def create_workflow_from_ai(order_number: str):
             },
         )
 
-    # Step 5: Return the actual workflow returned by Java.
     return {
-        "message": "AI proposal submitted to the workflow service",
+        "message": (
+            "AI proposal submitted to the workflow service"
+        ),
         "order_number": order_number,
         "proposal": proposal.model_dump(),
         "workflow": response.json(),
     }
+
+
+# =========================================================
+# 11. RAG QUESTION-ANSWERING ENDPOINT
+# =========================================================
+
+@app.post("/ai/ask")
+async def ask_with_rag(request: RAGQuestionRequest):
+    """
+    Retrieve policy passages from ChromaDB and generate
+    an answer using the local Qwen model.
+    """
+
+    try:
+        result = await asyncio.to_thread(
+            generate_rag_answer,
+            request.question,
+        )
+
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
+
+
+# =========================================================
+# 12. MULTI-AGENT ORDER INVESTIGATION
+# =========================================================
+
+@app.get("/ai/agents/investigate/{order_number}")
+async def investigate_with_agents(order_number: str):
+    """
+    Coordinate the Order Investigator, Policy, and
+    Support Triage agents.
+
+    This endpoint returns recommendations only.
+    It does not create tickets or approve workflows.
+    """
+
+    # Step 1: Fetch authoritative order data from Java.
+    order = await fetch_order(order_number)
+
+    # Step 2: Run the agents in a worker thread.
+    try:
+        result = await asyncio.to_thread(
+            run_multi_agent_investigation,
+            order_number,
+            order,
+        )
+
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
