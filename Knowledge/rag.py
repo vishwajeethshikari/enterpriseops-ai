@@ -398,3 +398,85 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def ingest_policies() -> dict:
+    """Index Markdown policies and remove obsolete chunks."""
+
+    if not KNOWLEDGE_DIR.exists():
+        raise FileNotFoundError(
+            f"Knowledge folder not found: {KNOWLEDGE_DIR}"
+        )
+
+    files = sorted(
+        path for path in KNOWLEDGE_DIR.glob("*.md")
+        if path.is_file()
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            f"No Markdown files found in {KNOWLEDGE_DIR}"
+        )
+
+    total_chunks = 0
+
+    for file_path in files:
+        text = file_path.read_text(encoding="utf-8")
+        chunks = chunk_text(text)
+
+        if not chunks:
+            raise ValueError(
+                f"Policy file contains no indexable text: "
+                f"{file_path.name}"
+            )
+
+        ids = [
+            f"{file_path.stem}-{index}"
+            for index in range(len(chunks))
+        ]
+
+        metadatas = [
+            {
+                "source": file_path.name,
+                "chunk": index,
+            }
+            for index in range(len(chunks))
+        ]
+
+        # Generate all embeddings before modifying this file's
+        # existing indexed chunks.
+        embeddings = [
+            embed_text(chunk) for chunk in chunks
+        ]
+
+        # Save current chunks first.
+        collection.upsert(
+            ids=ids,
+            documents=chunks,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+        # Remove old chunks left over when a file became shorter.
+        existing = collection.get(
+            where={"source": file_path.name},
+            include=["metadatas"],
+        )
+
+        obsolete_ids = [
+            existing_id
+            for existing_id in existing["ids"]
+            if existing_id not in set(ids)
+        ]
+
+        if obsolete_ids:
+            collection.delete(ids=obsolete_ids)
+
+        total_chunks += len(chunks)
+
+    return {
+        "status": "success",
+        "files_indexed": len(files),
+        "chunks_indexed": total_chunks,
+        "collection": COLLECTION_NAME,
+        "storage": str(CHROMA_DIR),
+    }

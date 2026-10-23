@@ -1,9 +1,9 @@
-
 import asyncio
 import json
 import logging
+import time
 from typing import Literal
-from orchestrator import run_order_workflow
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from ollama import AsyncClient
@@ -15,6 +15,14 @@ from pydantic import (
     field_validator,
 )
 
+from orchestrator import run_order_workflow
+from core.config import settings
+from core.logging_config import configure_logging
+from services.order_service import get_order
+from services.workflow_service import (
+    create_workflow as create_workflow_service,
+)
+from schemas.orders import OrderInvestigationRequest
 from Knowledge.rag import generate_rag_answer
 from agents import run_multi_agent_investigation
 
@@ -23,7 +31,7 @@ from agents import run_multi_agent_investigation
 # 1. APPLICATION CONFIGURATION
 # =========================================================
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger("enterpriseops-ai")
 
 app = FastAPI(
@@ -35,11 +43,17 @@ app = FastAPI(
     version="2.1.0",
 )
 
-JAVA_API = "http://localhost:8080/api/v1/orders"
-JAVA_TICKETS_API = "http://localhost:8080/api/v1/tickets"
-JAVA_WORKFLOWS_API = "http://localhost:8080/api/v1/workflows"
+JAVA_API = (
+    f"{settings.java_base_url.rstrip('/')}/api/v1/orders"
+)
+JAVA_TICKETS_API = (
+    f"{settings.java_base_url.rstrip('/')}/api/v1/tickets"
+)
+JAVA_WORKFLOWS_API = (
+    f"{settings.java_base_url.rstrip('/')}/api/v1/workflows"
+)
 
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_MODEL = settings.ollama_chat_model
 
 
 # =========================================================
@@ -106,7 +120,10 @@ class TicketProposal(BaseModel):
 
 
 class RAGQuestionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
 
     question: str = Field(min_length=3, max_length=2000)
 
@@ -129,70 +146,38 @@ def health():
 # =========================================================
 
 async def fetch_order(order_number: str) -> dict:
-    # Validate before inserting the value into the request URL.
-    if not order_number or not order_number.strip():
+    """Validate the order number and retrieve data through the service."""
+    try:
+        OrderInvestigationRequest(order_number=order_number)
+    except ValidationError as exc:
         raise HTTPException(
             status_code=422,
-            detail="Order number is required",
-        )
+            detail=(
+                "Order number must match ORD- followed by "
+                "at least four digits"
+            ),
+        ) from exc
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{JAVA_API}/{order_number}"
-            )
+        return await get_order(order_number)
 
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Java order service request timed out",
-        ) from exc
-
-    except httpx.RequestError as exc:
-        logger.warning("Order service connection failed")
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to the Java order service",
-        ) from exc
-
-    if response.status_code == 404:
+    except LookupError as exc:
         raise HTTPException(
             status_code=404,
-            detail="Order not found",
-        )
-
-    if response.is_error:
-        logger.warning(
-            "Order service returned HTTP %s",
-            response.status_code,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Java order service returned an error",
-        )
-
-    try:
-        order = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Java order service returned invalid JSON",
+            detail=str(exc),
         ) from exc
 
-    if not isinstance(order, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="Java order service returned an invalid order",
+    except RuntimeError as exc:
+        message = str(exc)
+        status_code = (
+            504 if "timed out" in message.lower() else 502
         )
+        logger.warning("Order service request failed: %s", message)
 
-    # Do not trust a response for a different order.
-    if order.get("orderNumber") != order_number:
         raise HTTPException(
-            status_code=502,
-            detail="Java returned an unexpected order number",
-        )
-
-    return order
+            status_code=status_code,
+            detail=message,
+        ) from exc
 
 
 # =========================================================
@@ -219,14 +204,16 @@ async def generate_structured_response(
     response_model: type[BaseModel],
 ) -> BaseModel:
     """
-    Ask Ollama for schema-constrained JSON and validate it
-    against the expected Pydantic model.
-
-    Invalid output is rejected; it is never treated as a
-    successful business action.
+    Generate schema-constrained JSON with Ollama, log performance metrics,
+    and validate the result before returning it.
     """
+    started_at = time.perf_counter()
+
     try:
-        result = await AsyncClient().chat(
+        result = await AsyncClient(
+            host=settings.ollama_base_url,
+            timeout=settings.request_timeout_seconds,
+        ).chat(
             model=OLLAMA_MODEL,
             messages=[
                 {
@@ -246,11 +233,29 @@ async def generate_structured_response(
             ],
             format=response_model.model_json_schema(),
             options={"temperature": 0},
+            keep_alive="30m",
+        )
+
+        elapsed_seconds = time.perf_counter() - started_at
+
+        logger.info(
+            (
+                "Ollama performance | model=%s | schema=%s | "
+                "request_total=%.2fs | model_total=%.2fs | "
+                "load=%.2fs | prompt_eval=%.2fs | generation=%.2fs"
+            ),
+            OLLAMA_MODEL,
+            response_model.__name__,
+            elapsed_seconds,
+            (getattr(result, "total_duration", 0) or 0) / 1_000_000_000,
+            (getattr(result, "load_duration", 0) or 0) / 1_000_000_000,
+            (getattr(result, "prompt_eval_duration", 0) or 0) / 1_000_000_000,
+            (getattr(result, "eval_duration", 0) or 0) / 1_000_000_000,
         )
 
         content = result.message.content
 
-        # Pydantic validates JSON structure, field types and constraints.
+        # Validate the AI-generated JSON against the requested Pydantic model.
         return response_model.model_validate_json(content)
 
     except ValidationError as exc:
@@ -273,14 +278,17 @@ async def generate_structured_response(
         raise
 
     except Exception as exc:
-        logger.exception("AI generation failed")
+        logger.exception(
+            "Ollama generation failed for schema %s",
+            response_model.__name__,
+        )
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "AI_GENERATION_FAILED",
                 "message": (
-                    "Could not generate or parse a valid AI response. "
-                    "Check Ollama and the configured model."
+                    "Could not generate a valid AI response. "
+                    "Check Ollama, the configured model, and the request timeout."
                 ),
             },
         ) from exc
@@ -317,7 +325,7 @@ Rules:
 Requested order number: {order_number}
 
 Order data:
-{json.dumps(order, indent=2, ensure_ascii=False, default=str)}
+{json.dumps(order, ensure_ascii=False, default=str, separators=(',', ':'))}
 """
 
     investigation = await generate_structured_response(
@@ -325,7 +333,7 @@ Order data:
         AIOrderInvestigation,
     )
 
-    # Schema validity does not guarantee the requested order matches.
+    # Ensure the AI did not return a different order number.
     if investigation.order_number != order_number:
         raise HTTPException(
             status_code=502,
@@ -365,7 +373,7 @@ Rules:
 Requested order number: {order_number}
 
 Order data:
-{json.dumps(order, indent=2, ensure_ascii=False, default=str)}
+{json.dumps(order, ensure_ascii=False, default=str, separators=(',', ':'))}
 """
 
     proposal = await generate_structured_response(
@@ -405,9 +413,10 @@ async def propose_ticket(order_number: str):
 @app.post("/tickets", status_code=201)
 async def create_support_ticket(request: CreateTicketRequest):
     """
-    This endpoint creates a ticket directly through Java.
-    It does not require a workflow approval in the current design.
-    Protect this endpoint with authorization before production use.
+    Creates a support ticket directly through Spring Boot.
+
+    This endpoint does not require workflow approval in the
+    current design. Protect it with authorization before production.
     """
     order = await fetch_order(request.orderNumber)
 
@@ -418,7 +427,9 @@ async def create_support_ticket(request: CreateTicketRequest):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds
+        ) as client:
             response = await client.post(
                 JAVA_TICKETS_API,
                 json=payload,
@@ -475,69 +486,44 @@ async def create_support_ticket(request: CreateTicketRequest):
 @app.post("/ai/create-workflow/{order_number}")
 async def create_workflow_from_ai(order_number: str):
     """
-    Generates a validated proposal and asks Spring Boot to create
-    a PENDING_APPROVAL workflow.
+    Generates a validated AI proposal and submits it to Spring Boot.
 
-    This endpoint does not approve the workflow or create a ticket.
+    The workflow remains pending approval. This endpoint does not
+    approve the workflow or directly create a support ticket.
     """
     order = await fetch_order(order_number)
 
-    # Step 1: Generate structured and validated AI output.
+    # Step 1: Generate and validate the AI proposal.
     proposal = await generate_ticket_proposal(
         order_number,
         order,
     )
 
-    # Step 2: Construct only the fields accepted by Java.
+    # Step 2: Construct the payload accepted by Spring Boot.
     payload = {
         "orderNumber": proposal.order_number,
         "issueDescription": proposal.issue_description,
         "priority": proposal.priority,
     }
 
-    # Step 3: Persist the proposal as a workflow in Spring Boot.
+    # Step 3: Create the workflow through the service layer.
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                JAVA_WORKFLOWS_API,
-                json=payload,
-            )
+        workflow = await create_workflow_service(payload)
 
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=504,
-            detail=(
-                "Workflow creation timed out. Verify the workflow "
-                "in Spring Boot before retrying."
-            ),
-        ) from exc
+    except RuntimeError as exc:
+        message = str(exc)
+        status_code = (
+            504 if "timed out" in message.lower() else 502
+        )
 
-    except httpx.RequestError as exc:
-        logger.warning("Workflow service connection failed")
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to the Java workflow service",
-        ) from exc
-
-    if response.is_error:
         logger.warning(
-            "Workflow service returned HTTP %s",
-            response.status_code,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Java could not create the workflow",
-                "java_status_code": response.status_code,
-            },
+            "Workflow creation failed: %s",
+            message,
         )
 
-    try:
-        workflow = response.json()
-    except ValueError as exc:
         raise HTTPException(
-            status_code=502,
-            detail="Java workflow service returned invalid JSON",
+            status_code=status_code,
+            detail=message,
         ) from exc
 
     return {
@@ -555,14 +541,15 @@ async def create_workflow_from_ai(order_number: str):
 @app.post("/ai/ask")
 async def ask_with_rag(request: RAGQuestionRequest):
     """
-    Retrieve policy passages from ChromaDB and generate
-    an answer using the existing RAG implementation.
+    Retrieves relevant policy passages from ChromaDB and
+    generates an answer using the existing RAG implementation.
     """
     try:
         result = await asyncio.to_thread(
             generate_rag_answer,
             request.question,
         )
+
         return result
 
     except ValueError as exc:
@@ -573,6 +560,7 @@ async def ask_with_rag(request: RAGQuestionRequest):
 
     except RuntimeError as exc:
         logger.warning("RAG request failed")
+
         raise HTTPException(
             status_code=502,
             detail="The RAG service could not complete the request",
@@ -586,8 +574,8 @@ async def ask_with_rag(request: RAGQuestionRequest):
 @app.get("/ai/agents/investigate/{order_number}")
 async def investigate_with_agents(order_number: str):
     """
-    Coordinate the Order Investigator, Policy Agent and Support
-    Triage Agent.
+    Coordinates the Order Investigator, Policy Agent and
+    Support Triage Agent.
 
     This endpoint returns recommendations only. It does not
     create tickets or approve workflows.
@@ -611,16 +599,25 @@ async def investigate_with_agents(order_number: str):
 
     except RuntimeError as exc:
         logger.warning("Multi-agent investigation failed")
+
         raise HTTPException(
             status_code=502,
             detail="The multi-agent investigation could not complete",
         ) from exc
-    
+
+
+# =========================================================
+# 13. END-TO-END AI WORKFLOW AUTOMATION
+# =========================================================
+
 @app.post("/ai/automate/{order_number}")
 async def automate_order(order_number: str):
     """
-    Run the agents and prepare a support workflow
-    for human approval.
+    Runs the multi-agent investigation, generates a proposal,
+    and prepares a workflow for human approval.
+
+    The Spring Boot workflow engine remains responsible for
+    enforcing approval and ticket-creation rules.
     """
     return await run_order_workflow(
         order_number=order_number,
@@ -629,4 +626,3 @@ async def automate_order(order_number: str):
         generate_proposal=generate_ticket_proposal,
         workflows_api=JAVA_WORKFLOWS_API,
     )
-
